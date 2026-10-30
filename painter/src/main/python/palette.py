@@ -111,8 +111,12 @@ class PaletteEditWidget(QtWidgets.QWidget):
         
         # These are the default brushes
         # name, colour (r,g,b,a), keyboard shortcut
+        # The pythonpanic land cover classes.
         default_brushes = [
-            ('Foreground', (255, 0, 0, 180), '1'),
+            ('forest', (255, 0, 0, 180), '1'),
+            ('wetland', (255, 0, 255, 180), '2'),
+            ('heather', (255, 200, 0, 180), '3'),
+            ('water', (0, 0, 255, 180), '4'),
                     ]
         
         self.brush_widgets = []
@@ -157,7 +161,25 @@ class PaletteEditWidget(QtWidgets.QWidget):
 
         for brush_widget in self.brush_widgets:
             # name, rgba, keyboard shortcut
+            # Alpha is fixed: a transparent brush would look like the eraser
+            # to the trainer.
+            r, g, b, _ = brush_widget.color.getRgb()
             brush_data.append([brush_widget.name,
-                               brush_widget.color.getRgb(),
+                               (r, g, b, 180),
                                str(len(brush_data))])
         return brush_data
+
+    def get_validation_error(self):
+        """ Message explaining why the brushes can't be used, or None """
+        brush_data = self.get_brush_data()
+        if len(brush_data) < 2:
+            return 'At least one foreground class must be specified'
+        if len(brush_data) > 10:
+            return 'At most 9 classes are supported (keyboard shortcuts 1-9)'
+        names = [b[0].strip() for b in brush_data]
+        if '' in names or len(set(names)) != len(names):
+            return 'Each brush must have a unique name'
+        colours = [tuple(b[1][:3]) for b in brush_data]
+        if len(set(colours)) != len(colours):
+            return 'Each brush must have a different colour'
+        return None

@@ -67,3 +67,54 @@ def get_metrics(tp, fp, tn, fn, defined_sum, duration, loss=float('nan')):
         "duration": duration,
         "loss": loss,
     }
+
+
+def class_confusion(pred_map, true_map, defined, num_classes):
+    """ Per foreground class TP, FP, TN, FN counted over defined pixels.
+        pred_map and true_map are class index maps (0 = background).
+        Works for numpy arrays and torch tensors.
+        Returns a (num_classes, 4) numpy array of [tp, fp, tn, fn]. """
+    pred = pred_map[defined > 0]
+    true = true_map[defined > 0]
+    counts = np.zeros((num_classes, 4), dtype=np.int64)
+    for c in range(1, num_classes + 1):
+        p = pred == c
+        t = true == c
+        counts[c-1] = [int((p & t).sum()), int((p & ~t).sum()),
+                       int((~p & ~t).sum()), int((~p & t).sum())]
+    return counts
+
+
+def get_multiclass_metrics(counts, defined_sum, duration, loss=float('nan')):
+    """ Summed TP/FP/TN/FN over classes plus 'f1' as the mean F1 of the
+        classes that appear in the annotation or prediction (macro F1),
+        which is used to decide whether a model is better.
+        Per class metrics are in 'per_class'. """
+    tp, fp, tn, fn = [int(v) for v in counts.sum(axis=0)]
+    metrics = get_metrics(tp, fp, tn, fn, defined_sum, duration, loss)
+    per_class = [get_metrics(*[int(v) for v in c], defined_sum, duration)
+                 for c in counts]
+    f1s = []
+    for c, m in zip(counts, per_class):
+        c_tp, c_fp, _, c_fn = c
+        if c_tp + c_fp + c_fn > 0:
+            f1s.append(0.0 if np.isnan(m['f1']) else m['f1'])
+    metrics['f1'] = float(np.mean(f1s)) if f1s else float('nan')
+    metrics['per_class'] = per_class
+    return metrics
+
+
+def get_per_class_csv_row(metrics):
+    now_str = datetime.now().strftime('%Y-%m-%d-%H:%M:%S')
+    parts = [now_str]
+    for m in metrics['per_class']:
+        parts += [round(m['precision'], 4), round(m['recall'], 4),
+                  round(m['f1'], 4)]
+    return ','.join([str(p) for p in parts]) + '\n'
+
+
+def get_per_class_csv_header(class_names):
+    cols = ['date_time']
+    for name in class_names:
+        cols += [f'{name}_precision', f'{name}_recall', f'{name}_f1']
+    return ','.join(cols)

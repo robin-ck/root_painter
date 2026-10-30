@@ -38,7 +38,7 @@ def elastic_transform(photo, annot):
                                       scale=random.random(),
                                       intensity=0.4 + (0.6 * random.random()))
     photo = elastic.transform_image(photo, def_map)
-    annot = elastic.transform_image(annot, def_map, channels=2)
+    annot = elastic.transform_image(annot, def_map, channels=annot.shape[2])
     annot = np.round(annot).astype(np.int64)
     return photo, annot
 
@@ -88,11 +88,14 @@ class UNetTransformer():
 
 class TrainDataset(Dataset):
     def __init__(self, train_annot_dir, dataset_dir, in_w, out_w,
-                 min_epoch_tiles=612):
+                 min_epoch_tiles=612, classes=None):
         """
         in_w and out_w are the tile size in pixels
         min_epoch_tiles: minimum number of samples per epoch
+        classes: project brushes [[name, rgba, key], ...], Background first.
+                 None for a legacy binary (red/green) project.
         """
+        self.classes = classes
         self.in_w = in_w
         self.out_w = out_w
         self.train_annot_dir = train_annot_dir
@@ -114,8 +117,8 @@ class TrainDataset(Dataset):
         padded_h = image.shape[0] + (im_pad_w * 2)
         padded_im = im_utils.pad(image, im_pad_w)
 
-        # This speeds up the padding.
-        annot = annot[:, :, :2]
+        # (H, W, 1 + num_classes), channel 0 is background
+        annot = im_utils.annot_to_onehot(annot, self.classes).astype(np.float32)
         padded_annot = im_utils.pad(annot, im_pad_w)
         right_lim = padded_w - self.in_w
         bottom_lim = padded_h - self.in_w
@@ -136,7 +139,7 @@ class TrainDataset(Dataset):
         im_tile = padded_im[y_in:y_in+self.in_w,
                             x_in:x_in+self.in_w]
 
-        assert annot_tile.shape == (self.in_w, self.in_w, 2), (
+        assert annot_tile.shape[:2] == (self.in_w, self.in_w), (
             f" shape is {annot_tile.shape} for tile from {fname}")
 
         assert im_tile.shape == (self.in_w, self.in_w, 3), (
@@ -147,20 +150,17 @@ class TrainDataset(Dataset):
         im_tile, annot_tile = self.augmentor.transform(im_tile, annot_tile)
         im_tile = im_utils.normalize_tile(im_tile)
 
-        foreground = np.array(annot_tile)[:, :, 0]
-        background = np.array(annot_tile)[:, :, 1]
-
+        annot_tile = np.array(annot_tile)
         # Annotion is cropped post augmentation to ensure
         # elastic grid doesn't remove the edges.
-        foreground = foreground[tile_pad:-tile_pad, tile_pad:-tile_pad]
-        background = background[tile_pad:-tile_pad, tile_pad:-tile_pad]
+        annot_tile = annot_tile[tile_pad:-tile_pad, tile_pad:-tile_pad]
         # mask specified pixels of annotation which are defined
-        mask = foreground + background
-        mask = mask.astype(np.float32)
-        mask = torch.from_numpy(mask)
-        foreground = foreground.astype(np.int64)
-        foreground = torch.from_numpy(foreground)
+        mask = np.sum(annot_tile, axis=2) > 0
+        mask = torch.from_numpy(mask.astype(np.float32))
+        # one target channel per foreground class (background is all zeros)
+        target = np.moveaxis(annot_tile[:, :, 1:], -1, 0)
+        target = torch.from_numpy(target.astype(np.float32))
         im_tile = im_tile.astype(np.float32)
         im_tile = np.moveaxis(im_tile, -1, 0)
         im_tile = torch.from_numpy(im_tile)
-        return im_tile, foreground, mask
+        return im_tile, target, mask

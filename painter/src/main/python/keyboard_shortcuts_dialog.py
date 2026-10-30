@@ -26,7 +26,8 @@ class KeyboardShortcutsDialog(QtWidgets.QDialog):
         self.setMinimumSize(370, 460)
 
         shortcuts = [
-            ("Foreground", "Q"),
+            ("Foreground (first class)", "Q"),
+            ("Class brushes", "1-9"),
             ("Background", "W"),
             ("Eraser", "E"),
             ("Undo", "Z"),

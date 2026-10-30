@@ -19,6 +19,7 @@ import torch
 from torch.nn.functional import softmax
 from torch.nn.functional import cross_entropy
 from torch.nn.functional import binary_cross_entropy
+from torch.nn.functional import binary_cross_entropy_with_logits
 
 
 def dice_loss(predictions, labels):
@@ -69,3 +70,29 @@ def combined_loss2(preds, labels, mask=None):
     if torch.sum(labels) > 0:
         return dice_loss2(preds, labels) + cx
     return cx
+
+
+def masked_bce_dice_loss(logits, targets, defined):
+    """ Multiclass loss from pythonpanic (source/losses.py): BCE + Dice on
+        sigmoid outputs, one channel per foreground class.
+
+        logits, targets: (B, C, H, W). targets are 1 for the painted class
+        and 0 for the other classes (background pixels are 0 everywhere).
+        defined: (B, H, W), 1 where the pixel was annotated. Pixels that
+        were not annotated do not count towards the loss.
+    """
+    defined = defined[:, None].expand_as(logits)
+    bce = binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    bce = (bce * defined).sum() / defined.sum().clamp_min(1.0)
+
+    probs = torch.sigmoid(logits) * defined
+    tp = (probs * targets).sum(dim=(0, 2, 3))
+    fp = (probs * (1 - targets)).sum(dim=(0, 2, 3))
+    fn = ((1 - probs) * targets * defined).sum(dim=(0, 2, 3))
+    eps = 1e-6
+    dice = (2 * tp + eps) / (2 * tp + fp + fn + eps)
+    # Dice is only meaningful for classes present in the annotation
+    class_present = targets.sum(dim=(0, 2, 3)) > 0
+    if class_present.any():
+        return bce + (1 - dice[class_present]).mean()
+    return bce

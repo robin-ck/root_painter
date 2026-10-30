@@ -47,6 +47,54 @@ def normalize_tile(tile):
     assert np.max(tile) <= 1, f"tile max {np.max(tile)}"
     return tile
 
+
+def annot_to_onehot(annot, classes=None):
+    """ Decode an annotation PNG saved by the painter.
+
+        classes is the project's brush list [[name, [r, g, b, a], key], ...]
+        with Background first. Each painted pixel is assigned to the brush
+        with the nearest colour (PNG saving of semi-transparent colours can
+        shift RGB values slightly).
+
+        Returns (H, W, len(classes)) uint8: channel 0 is background,
+        channel i is classes[i]. A pixel with all zeros is not annotated.
+
+        Without classes (projects created before multiclass support)
+        red is foreground and green is background, so channel 0 is
+        background and channel 1 is foreground as before.
+    """
+    annot = np.asarray(annot)
+    if classes is None:
+        onehot = np.zeros(annot.shape[:2] + (2,), dtype=np.uint8)
+        onehot[:, :, 0] = annot[:, :, 1] > 0
+        onehot[:, :, 1] = annot[:, :, 0] > 0
+        return onehot
+    if annot.shape[2] == 4:
+        defined = annot[:, :, 3] > 0
+    else:
+        defined = np.any(annot[:, :, :3] > 0, axis=2)
+    colours = np.array([c[1][:3] for c in classes], dtype=np.float32)
+    ys, xs = np.nonzero(defined)
+    rgb = annot[ys, xs, :3].astype(np.float32)
+    dists = np.sum((rgb[:, None, :] - colours[None, :, :]) ** 2, axis=2)
+    onehot = np.zeros(annot.shape[:2] + (len(classes),), dtype=np.uint8)
+    onehot[ys, xs, np.argmin(dists, axis=1)] = 1
+    return onehot
+
+
+def class_map_to_rgba(class_map, classes=None):
+    """ Colour a class index map (0 = background) for display in the painter.
+        Uses each class's brush colour, or cyan for legacy binary projects. """
+    seg = np.zeros(class_map.shape + (4,), dtype=np.uint8)
+    if classes is None:
+        seg[class_map > 0] = [0, 255, 255, 178]
+        return seg
+    for i, (_name, rgba, _key) in enumerate(classes):
+        if i > 0:
+            seg[class_map == i] = [rgba[0], rgba[1], rgba[2], 178]
+    return seg
+
+
 def load_train_image_and_annot(dataset_dir, train_annot_dir):
     max_attempts = 60
     attempts = 0
@@ -84,7 +132,8 @@ def load_train_image_and_annot(dataset_dir, train_annot_dir):
             latest_im_path = image_path
             image = load_image(image_path)
             latest_annot_path = annot_path
-            annot = imread(annot_path).astype(bool)
+            # raw RGBA, decoded with annot_to_onehot by the dataset
+            annot = imread(annot_path)
             assert np.sum(annot) > 0
             assert image.shape[2] == 3 # should be RGB
             # also return fname for debugging purposes.

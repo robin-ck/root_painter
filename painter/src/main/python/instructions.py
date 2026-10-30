@@ -42,8 +42,8 @@ def fix_instruction_paths(old_config, sync_dir):
     # remove part of path that might be different on server.
     new_config = {}
     for k, v in old_config.items():
-        if k == 'file_names':
-            # names dont need anything removing
+        if k in ('file_names', 'classes'):
+            # names and classes dont need anything removing
             new_config[k] = v
         elif isinstance(v, list):
             # if its a list fix each string in the list.

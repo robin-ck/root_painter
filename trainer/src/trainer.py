@@ -33,21 +33,37 @@ import shutil
 
 import numpy as np
 import torch
-from torch.nn.functional import softmax
 from torch.utils.data import DataLoader
-from loss import combined_loss as criterion
+from loss import masked_bce_dice_loss as criterion
 
 from datasets import TrainDataset
-from metrics import get_metrics, get_metrics_str, get_metric_csv_row
+from metrics import get_metrics_str, get_metric_csv_row
+from metrics import class_confusion, get_multiclass_metrics
+from metrics import get_per_class_csv_row, get_per_class_csv_header
 from model_utils import ensemble_segment
 from model_utils import create_first_model_with_random_weights
 import model_utils
 from model_utils import save_if_better
 
-from im_utils import is_photo, load_image, save_then_move
+from im_utils import is_photo, load_image, save_then_move, class_map_to_rgba
 from file_utils import ls
 from startup import startup_setup, ensure_required_folders_exist
 from unet import get_valid_patch_sizes
+
+def get_num_classes(classes):
+    """ Number of foreground classes. classes is the project's brush list
+        with Background first, or None for a legacy binary project. """
+    if classes:
+        return len(classes) - 1
+    return 1
+
+
+def check_model_classes(model, num_classes, model_path):
+    model_classes = model.module.num_classes
+    if model_classes != num_classes:
+        raise ValueError(f'Model {model_path} has {model_classes} classes '
+                         f'but the project has {num_classes}.')
+
 
 class Trainer():
 
@@ -143,8 +159,8 @@ class Trainer():
         """ get paths relative to local machine """
         new_config = {}
         for k, v in old_config.items():
-            if k == 'file_names' or k == 'format':
-                # names and format specified dont need a path appending
+            if k in ('file_names', 'format', 'classes'):
+                # names, format and classes dont need a path appending
                 new_config[k] = v
             elif isinstance(v, list):
                 # if its a list fix each string in the list.
@@ -252,16 +268,21 @@ class Trainer():
             self.epochs_without_progress = 0
             self.msg_dir = self.train_config['message_dir']
             model_dir = self.train_config['model_dir']
+            classes = config.get('classes')
             self.train_set = TrainDataset(self.train_config['train_annot_dir'],
                                           self.train_config['dataset_dir'],
-                                          self.in_w, self.out_w)
+                                          self.in_w, self.out_w,
+                                          classes=classes)
+            num_classes = get_num_classes(classes)
             model_paths = model_utils.get_latest_model_paths(model_dir, 1)
             if model_paths:
                 self.model = model_utils.load_model(model_paths[0])
+                check_model_classes(self.model, num_classes, model_paths[0])
             else:
-                self.model = create_first_model_with_random_weights(model_dir)
-            self.optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01,
-                                             momentum=0.99, nesterov=True)
+                self.model = create_first_model_with_random_weights(model_dir,
+                                                                    num_classes)
+            # optimizer settings from pythonpanic
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-4)
             self.model.train()
             self.training = True
 
@@ -309,51 +330,32 @@ class Trainer():
                                   drop_last=False, pin_memory=True)
         epoch_start = time.time()
         self.model.train()
-        tps = 0
-        fps = 0
-        tns = 0
-        fns = 0
+        counts = None
         defined_total = 0
         loss_sum = 0
         for step, (photo_tiles,
-                   foreground_tiles,
+                   target_tiles,
                    defined_tiles) in enumerate(train_loader):
 
             self.check_for_instructions()
             photo_tiles = photo_tiles.to(device)
-            foreground_tiles = foreground_tiles.to(device)
+            target_tiles = target_tiles.to(device)
             defined_tiles = defined_tiles.to(device)
             self.optimizer.zero_grad()
             outputs = self.model(photo_tiles)
-            softmaxed = softmax(outputs, 1)
-            # just the foreground probability.
-            foreground_probs = softmaxed[:, 1, :]
-            # remove any of the predictions for which we don't have ground truth
-            # Set outputs to 0 where annotation undefined so that
-            # The network can predict whatever it wants without any penalty.
-            outputs[:, 0] *= defined_tiles
-            outputs[:, 1] *= defined_tiles
-            loss = criterion(outputs, foreground_tiles)
+            # pixels without annotation are ignored by the loss
+            loss = criterion(outputs, target_tiles, defined_tiles)
             loss.backward()
             self.optimizer.step()
-            foreground_probs *= defined_tiles
-            predicted = foreground_probs > 0.5
 
-            # we only want to calculate metrics on the
-            # part of the predictions for which annotations are defined
-            # so remove all predictions and foreground labels where
-            # we didn't have any annotation.
-
-            defined_list = defined_tiles.view(-1)
-            preds_list = predicted.view(-1)[defined_list > 0]
-            foregrounds_list = foreground_tiles.view(-1)[defined_list > 0]
-
-            # # calculate all the false positives, false negatives etc
-            tps += torch.sum((foregrounds_list == 1) * (preds_list == 1)).cpu().numpy()
-            tns += torch.sum((foregrounds_list == 0) * (preds_list == 0)).cpu().numpy()
-            fps += torch.sum((foregrounds_list == 0) * (preds_list == 1)).cpu().numpy()
-            fns += torch.sum((foregrounds_list == 1) * (preds_list == 0)).cpu().numpy()
-            defined_total += torch.sum(defined_list > 0).cpu().numpy()
+            # we only want to calculate metrics on the
+            # part of the predictions for which annotations are defined
+            pred_map, true_map = model_utils.batch_class_maps(outputs.detach(),
+                                                              target_tiles)
+            step_counts = class_confusion(pred_map, true_map, defined_tiles,
+                                          outputs.shape[1])
+            counts = step_counts if counts is None else counts + step_counts
+            defined_total += torch.sum(defined_tiles > 0).cpu().numpy()
             loss_sum += loss.item() # float
 
             # https://github.com/googlecolab/colabtools/issues/166
@@ -369,8 +371,8 @@ class Trainer():
         duration = round(time.time() - epoch_start, 3)
         print('epoch train duration', duration)
         avg_loss = loss_sum / (step + 1)
-        self.log_metrics('train', get_metrics(tps, fps, tns, fns,
-                                              defined_total, duration, avg_loss))
+        self.log_metrics('train', get_multiclass_metrics(counts, defined_total,
+                                                         duration, avg_loss))
         before_val_time = time.time()
         self.validation()
         print('epoch validation duration', time.time() - before_val_time)
@@ -387,6 +389,17 @@ class Trainer():
         with open(fpath, 'a+') as log_file:
             log_file.write(get_metric_csv_row(metrics))
             log_file.flush()
+        # Per class precision, recall and f1 in a separate file so the
+        # format of the file above stays the same.
+        classes = self.train_config.get('classes')
+        if classes:
+            class_names = [c[0] for c in classes[1:]]
+            fpath = fpath[:-len('.csv')] + '_per_class.csv'
+            if not os.path.isfile(fpath):
+                print(get_per_class_csv_header(class_names), file=open(fpath, 'w+'))
+            with open(fpath, 'a+') as log_file:
+                log_file.write(get_per_class_csv_row(metrics))
+                log_file.flush()
 
     def validation(self):
         """ Get validation set metrics for current model and previous model.
@@ -401,7 +414,8 @@ class Trainer():
         get_val_metrics = partial(model_utils.get_val_metrics,
                                   val_annot_dir=self.train_config['val_annot_dir'],
                                   dataset_dir=self.train_config['dataset_dir'],
-                                  in_w=self.in_w, out_w=self.out_w, bs=self.bs)
+                                  in_w=self.in_w, out_w=self.out_w, bs=self.bs,
+                                  classes=self.train_config.get('classes'))
         prev_model, prev_path = model_utils.get_prev_model(model_dir)
         cur_metrics = get_val_metrics(copy.deepcopy(self.model))
         prev_metrics = get_val_metrics(prev_model)
@@ -459,6 +473,7 @@ class Trainer():
         """
         in_dir = segment_config['dataset_dir']
         seg_dir = segment_config['seg_dir']
+        classes = segment_config.get('classes')
         format_str = 'RootPainter Default (.png)'
         if 'format' in segment_config:
             format_str = segment_config['format']
@@ -478,16 +493,20 @@ class Trainer():
             # if latest is not found then create a model with random weights
             # and use that.
             if not model_paths:
-                create_first_model_with_random_weights(model_dir)
+                create_first_model_with_random_weights(model_dir,
+                                                       get_num_classes(classes))
                 model_paths = model_utils.get_latest_model_paths(model_dir, 1)
         start = time.time()
         for fname in fnames:
             self.segment_file(in_dir, seg_dir, fname,
-                              model_paths, format_str)
+                              model_paths, format_str, classes)
         duration = time.time() - start
         print(f'Seconds to segment {len(fnames)} images: ', round(duration, 3))
         
-    def segment_file(self, in_dir, seg_dir, fname, model_paths, format_str):
+    def segment_file(self, in_dir, seg_dir, fname, model_paths, format_str,
+                     classes=None):
+        """ seg_out is a class index map (0 = background). The default PNG
+            output shows each class in its brush colour. """
         fpath = os.path.join(in_dir, fname)
 
         # When the client navigates through images, there is a risk that 
@@ -555,15 +574,13 @@ class Trainer():
 
                 if format_str == 'RhizoVision Explorer (.png)':
                     # RVE needs segmentation in black and white
-                    # Load RootPainter blue channel and invert.
+                    # (any class is foreground).
                     seg_out = (seg_out == 0)
                 elif npy:
-                    seg_out = seg_out.astype(bool)
+                    # class index per pixel, 0 is background
+                    seg_out = seg_out.astype(np.uint8)
                 else:
                     # default output is PNG with alpha channel
-                    seg_alpha = np.zeros((seg_out.shape[0], seg_out.shape[1], 4))
-                    seg_alpha[seg_out > 0] = [0, 1.0, 1.0, 0.7]
-                    # Conver to uint8 to save as png without warning
-                    seg_out  = (seg_alpha * 255).astype(np.uint8)
+                    seg_out = class_map_to_rgba(seg_out, classes)
 
                 save_then_move(out_path, seg_out, npy)

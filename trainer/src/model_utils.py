@@ -22,14 +22,13 @@ import time
 import glob
 import numpy as np
 import torch
-from torch.nn.functional import softmax
 from skimage.io import imread
 from skimage import img_as_float32
 import im_utils
-from unet import UNetGNRes
-from metrics import get_metrics
+from seg_model import create_model, num_classes_from_state_dict
+from metrics import class_confusion, get_multiclass_metrics
 from file_utils import ls
-from loss import combined_loss as criterion
+from loss import masked_bce_dice_loss as criterion
 
 
 def get_device():
@@ -49,22 +48,27 @@ def get_latest_model_paths(model_dir, k):
     return fpaths
 
 def load_model(model_path):
-    model = UNetGNRes()
+    state_dict = torch.load(model_path, map_location=device)
+    # number of classes is read from the segmentation head
+    model = create_model(num_classes_from_state_dict(state_dict),
+                         pretrained=False)
     try:
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.load_state_dict(state_dict)
         model = torch.nn.DataParallel(model)
     except:
         model = torch.nn.DataParallel(model)
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.load_state_dict(state_dict)
     model.to(device)
     return model
 
-def create_first_model_with_random_weights(model_dir):
+def create_first_model_with_random_weights(model_dir, num_classes=1):
     # used when no model was specified on project creation.
+    # The decoder is random, the encoder starts from ImageNet weights
+    # (as in pythonpanic) when they can be downloaded.
     model_num = 1
     model_name = str(model_num).zfill(6)
     model_name += '_' + str(int(round(time.time()))) + '.pkl'
-    model = UNetGNRes()
+    model = create_model(num_classes)
     model = torch.nn.DataParallel(model)
     model_path = os.path.join(model_dir, model_name)
     torch.save(model.state_dict(), model_path)
@@ -78,10 +82,31 @@ def get_prev_model(model_dir):
     prev_model = load_model(prev_path)
     return prev_model, prev_path
 
-def get_val_metrics(cnn, val_annot_dir, dataset_dir, in_w, out_w, bs):
+
+def probs_to_class_map(probs, threshold=0.5):
+    """ (H, W, C) sigmoid probabilities to a class index map.
+        The most likely class wins, 0 (background) if no class
+        is above threshold. """
+    class_map = np.argmax(probs, axis=2) + 1
+    class_map[np.max(probs, axis=2) <= threshold] = 0
+    return class_map
+
+
+def batch_class_maps(outputs, targets, threshold=0.5):
+    """ Predicted and true class index maps for a training batch.
+        outputs are logits and targets are one-hot, both (B, C, H, W). """
+    max_prob, pred_idx = torch.sigmoid(outputs).max(1)
+    pred_map = (pred_idx + 1) * (max_prob > threshold)
+    max_true, true_idx = targets.max(1)
+    true_map = (true_idx + 1) * (max_true > 0)
+    return pred_map, true_map
+
+
+def get_val_metrics(cnn, val_annot_dir, dataset_dir, in_w, out_w, bs,
+                    classes=None):
     """
-    Return the TP, FP, TN, FN, defined_sum, duration
-    for the {cnn} on the validation set
+    Return the TP, FP, TN, FN (summed over classes), per class metrics
+    and mean class F1 for the {cnn} on the validation set
 
     TODO - This is too similar to the train loop. Merge both and use flags.
     """
@@ -89,14 +114,12 @@ def get_val_metrics(cnn, val_annot_dir, dataset_dir, in_w, out_w, bs):
     fnames = ls(val_annot_dir)
     fnames = [a for a in fnames if im_utils.is_photo(a)]
     # TODO: In order to speed things up, be a bit smarter here
-    # by only segmenting the parts of the image where we have
+    # by only segmenting the parts of the image where we have
     # some annotation defined.
     # implement a 'partial segment' which exlcudes tiles with no
     # annotation defined.
-    tps = 0
-    fps = 0
-    tns = 0
-    fns = 0
+    num_classes = len(classes) - 1 if classes else 1
+    counts = np.zeros((num_classes, 4), dtype=np.int64)
     defined_sum = 0
     for fname in fnames:
         annot_path = os.path.join(val_annot_dir,
@@ -113,13 +136,14 @@ def get_val_metrics(cnn, val_annot_dir, dataset_dir, in_w, out_w, bs):
             time.sleep(0.1)
             annot = imread(annot_path)
 
-        annot = np.array(annot)
-        foreground = annot[:, :, 0].astype(bool).astype(int)
-        background = annot[:, :, 1].astype(bool).astype(int)
+        onehot = im_utils.annot_to_onehot(annot, classes)
+        # mask defines which pixels are defined in the annotation.
+        mask = np.sum(onehot, axis=2) > 0
+        true_map = np.argmax(onehot, axis=2)
         image_path_part = os.path.join(dataset_dir, os.path.splitext(fname)[0])
 
         # Use glob.escape to allow arbitrary strings in file paths,
-        # including [ and ]  
+        # including [ and ]
         # For related bug See https://github.com/Abe404/root_painter/issues/87
         image_path_part = glob.escape(image_path_part)
 
@@ -130,21 +154,10 @@ def get_val_metrics(cnn, val_annot_dir, dataset_dir, in_w, out_w, bs):
                                  out_w, threshold=0.5)
         predicted = im_utils.crop_from_pad_settings(predicted, pad_settings)
 
-        # mask defines which pixels are defined in the annotation.
-        mask = foreground + background
-        mask = mask.astype(bool).astype(int)
-        predicted *= mask
-        predicted = predicted.astype(bool).astype(int)
-        y_defined = mask.reshape(-1)
-        y_pred = predicted.reshape(-1)[y_defined > 0]
-        y_true = foreground.reshape(-1)[y_defined > 0]
-        tps += np.sum(np.logical_and(y_pred == 1, y_true == 1))
-        tns += np.sum(np.logical_and(y_pred == 0, y_true == 0))
-        fps += np.sum(np.logical_and(y_pred == 1, y_true == 0))
-        fns += np.sum(np.logical_and(y_pred == 0, y_true == 1))
-        defined_sum += np.sum(y_defined > 0)
+        counts += class_confusion(predicted, true_map, mask, num_classes)
+        defined_sum += np.sum(mask)
     duration = round(time.time() - start, 3)
-    metrics = get_metrics(tps, fps, tns, fns, defined_sum, duration)
+    metrics = get_multiclass_metrics(counts, defined_sum, duration)
     return metrics
 
 def save_if_better(model_dir, cur_model, prev_model_path,
@@ -165,7 +178,8 @@ def save_if_better(model_dir, cur_model, prev_model_path,
 
 def ensemble_segment(model_paths, image, bs, in_w, out_w,
                      threshold=0.5):
-    """ Average predictions from each model specified in model_paths """
+    """ Average predictions from each model specified in model_paths.
+        Returns a class index map (0 = background). """
     pred_sum = None
     pred_count = 0
     image, pad_settings = im_utils.pad_to_min(image, min_w=in_w, min_h=in_w)
@@ -186,44 +200,31 @@ def ensemble_segment(model_paths, image, bs, in_w, out_w,
         pred_sum += np.fliplr(flipped_pred)
         pred_count += 1
     pred_sum = im_utils.crop_from_pad_settings(pred_sum, pad_settings)
-    foreground_probs = pred_sum / pred_count
-    predicted = foreground_probs > threshold
-    predicted = predicted.astype(int)
-    return predicted
+    class_probs = pred_sum / pred_count
+    return probs_to_class_map(class_probs, threshold)
 
 
 def epoch(model, train_loader, batch_size,
           optimizer, step_callback, stop_fn):
     """ One training epoch """
-    
+
     model.to(device)
     model.train()
-    tps = 0
-    fps = 0
-    tns = 0
-    fns = 0
+    counts = None
     defined_total = 0
     loss_sum = 0
 
     for step, (photo_tiles,
-               foreground_tiles,
+               target_tiles,
                defined_tiles) in enumerate(train_loader):
 
         photo_tiles = photo_tiles.to(device)
-        foreground_tiles = foreground_tiles.to(device).float()
+        target_tiles = target_tiles.to(device)
         defined_tiles = defined_tiles.to(device)
         optimizer.zero_grad()
 
         outputs = model(photo_tiles)
-        softmaxed = softmax(outputs, 1)
-
-        # just the foreground probability. (remove soon)
-        foreground_probs = softmaxed[:, 1, :]
-
-        outputs[:, 0] *= defined_tiles
-        outputs[:, 1] *= defined_tiles
-
-        loss = criterion(outputs, foreground_tiles.long())
+        loss = criterion(outputs, target_tiles, defined_tiles)
 
         loss.backward()
         optimizer.step()
@@ -231,27 +232,13 @@ def epoch(model, train_loader, batch_size,
         if step_callback:
             step_callback()
 
-        # This bit assumes we do softmax on the model output (not yet implemented)
-        # make the predictions match in undefined areas so metrics in these
-        # regions are not taken into account.
-        #outputs *= defined_tiles 
-        #predicted = outputs > 0.5
-
         # we only want to calculate metrics on the
         # part of the predictions for which annotations are defined
-        # so remove all predictions and foreground labels where
-        # we didn't have any annotation.
-
-        defined_list = defined_tiles.reshape(-1)
-        preds_list = foreground_probs.reshape(-1)[defined_list > 0] > 0.5
-        foregrounds_list = foreground_tiles.reshape(-1)[defined_list > 0]
-
-        # # calculate all the false positives, false negatives etc
-        tps += torch.sum((foregrounds_list == 1) * (preds_list == 1)).cpu().numpy()
-        tns += torch.sum((foregrounds_list == 0) * (preds_list == 0)).cpu().numpy()
-        fps += torch.sum((foregrounds_list == 0) * (preds_list == 1)).cpu().numpy()
-        fns += torch.sum((foregrounds_list == 1) * (preds_list == 0)).cpu().numpy()
-        defined_total += torch.sum(defined_list > 0).cpu().numpy()
+        pred_map, true_map = batch_class_maps(outputs.detach(), target_tiles)
+        step_counts = class_confusion(pred_map, true_map, defined_tiles,
+                                      outputs.shape[1])
+        counts = step_counts if counts is None else counts + step_counts
+        defined_total += torch.sum(defined_tiles > 0).cpu().numpy()
         loss_sum += loss.item()
         # https://github.com/googlecolab/colabtools/issues/166
         print(f"\rTraining: {(step+1) * batch_size}/"
@@ -261,15 +248,18 @@ def epoch(model, train_loader, batch_size,
         if stop_fn and stop_fn():
             return None
     avg_loss = loss_sum / (step + 1)
-    return (tps, fps, tns, fns, defined_total, avg_loss)
+    return (counts, defined_total, avg_loss)
 
 def unet_segment(cnn, image, bs, in_w, out_w, threshold=0.5):
     """
-    Threshold set to None means probabilities returned without thresholding.
+    Returns a class index map (0 = background), or with threshold set
+    to None the (H, W, C) per class probabilities.
     """
     assert image.shape[0] >= in_w, str(image.shape[0])
     assert image.shape[1] >= in_w, str(image.shape[1])
 
+    # BatchNorm and Dropout in the pythonpanic model need eval mode
+    cnn.eval()
     tiles, coords = im_utils.get_tiles(image,
                                        in_tile_shape=(in_w, in_w, 3),
                                        out_tile_shape=(out_w, out_w))
@@ -291,24 +281,20 @@ def unet_segment(cnn, image, bs, in_w, out_w, threshold=0.5):
         batches.append(tiles_for_gpu)
 
     output_tiles = []
-    for gpu_tiles in batches:
-        outputs = cnn(gpu_tiles.to(device))
-        softmaxed = softmax(outputs, 1)
-        foreground_probs = softmaxed[:, 1, :]  # just the foreground probability.
-        if threshold is not None:
-            predicted = foreground_probs > threshold
-            predicted = predicted.view(-1).int()
-        else:
-            predicted = foreground_probs
-
-        pred_np = predicted.data.cpu().numpy()
-        out_tiles = pred_np.reshape((len(gpu_tiles), out_w, out_w))
-        for out_tile in out_tiles:
-            output_tiles.append(out_tile)
+    with torch.no_grad():
+        for gpu_tiles in batches:
+            outputs = cnn(gpu_tiles.to(device))
+            # (B, C, H, W) to (B, H, W, C)
+            probs = torch.sigmoid(outputs).permute(0, 2, 3, 1)
+            for out_tile in probs.cpu().numpy():
+                output_tiles.append(out_tile)
 
     assert len(output_tiles) == len(coords), (
         f'{len(output_tiles)} {len(coords)}')
 
-    reconstructed = im_utils.reconstruct_from_tiles(output_tiles, coords,
-                                                    image.shape[:-1])
+    num_classes = output_tiles[0].shape[2]
+    reconstructed = im_utils.reconstruct_from_tiles(
+        output_tiles, coords, image.shape[:-1] + (num_classes,))
+    if threshold is not None:
+        return probs_to_class_map(reconstructed, threshold)
     return reconstructed

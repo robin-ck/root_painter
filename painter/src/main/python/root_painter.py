@@ -225,6 +225,10 @@ class RootPainter(QtWidgets.QMainWindow):
 
         self.proj_file_path = proj_file_path
 
+        # Brushes [[name, [r, g, b, a], shortcut], ...] with Background first.
+        # Not present for projects with only the default red/green brushes.
+        self.classes = settings.get('classes')
+
         # If there are any annotations which have already been saved
         # then go through the annotations in the order specified
         # by self.image_fnames
@@ -447,6 +451,8 @@ class RootPainter(QtWidgets.QMainWindow):
             "message_dir": self.message_dir,
             "model_dir": self.model_dir
         }
+        if self.classes:
+            content['classes'] = self.classes
         self.send_instruction('segment', content)
 
     def segment_current_image(self):
@@ -944,28 +950,33 @@ class RootPainter(QtWidgets.QMainWindow):
         brush_edit_action.triggered.connect(self.show_brush_size_edit)
 
 
-        # change brush colors
-        change_foreground_color_action = QtWidgets.QAction(QtGui.QIcon(""),
-                                                           "Foreground brush colour",
-                                                           self)
-        options_menu.addAction(change_foreground_color_action)
-        change_foreground_color_action.triggered.connect(self.change_foreground_color)
-        change_background_color_action = QtWidgets.QAction(QtGui.QIcon(""),
-                                                           "Background brush colour",
-                                                           self)
-        options_menu.addAction(change_background_color_action)
-        change_background_color_action.triggered.connect(self.change_background_color)
-
         brush_menu = menu_bar.addMenu("Brushes")
-        foreground_color_action = QtWidgets.QAction(QtGui.QIcon(""), "Foreground", self)
-        foreground_color_action.setShortcut("Q")
-        brush_menu.addAction(foreground_color_action)
-        foreground_color_action.triggered.connect(self.set_foreground_color)
+        if self.classes:
+            # The trainer tells classes apart by their brush colour,
+            # so colours are fixed when the project is created.
+            self.add_class_brushes(brush_menu)
+        else:
+            # change brush colors
+            change_foreground_color_action = QtWidgets.QAction(QtGui.QIcon(""),
+                                                               "Foreground brush colour",
+                                                               self)
+            options_menu.addAction(change_foreground_color_action)
+            change_foreground_color_action.triggered.connect(self.change_foreground_color)
+            change_background_color_action = QtWidgets.QAction(QtGui.QIcon(""),
+                                                               "Background brush colour",
+                                                               self)
+            options_menu.addAction(change_background_color_action)
+            change_background_color_action.triggered.connect(self.change_background_color)
 
-        background_color_action = QtWidgets.QAction(QtGui.QIcon(""), "Background", self)
-        background_color_action.setShortcut("W")
-        brush_menu.addAction(background_color_action)
-        background_color_action.triggered.connect(self.set_background_color)
+            foreground_color_action = QtWidgets.QAction(QtGui.QIcon(""), "Foreground", self)
+            foreground_color_action.setShortcut("Q")
+            brush_menu.addAction(foreground_color_action)
+            foreground_color_action.triggered.connect(self.set_foreground_color)
+
+            background_color_action = QtWidgets.QAction(QtGui.QIcon(""), "Background", self)
+            background_color_action.setShortcut("W")
+            brush_menu.addAction(background_color_action)
+            background_color_action.triggered.connect(self.set_background_color)
 
         eraser_color_action = QtWidgets.QAction(QtGui.QIcon(""), "Eraser", self)
         eraser_color_action.setShortcut("E")
@@ -1188,6 +1199,8 @@ class RootPainter(QtWidgets.QMainWindow):
             "log_dir": self.log_dir,
             "message_dir": self.message_dir
         }
+        if self.classes:
+            content['classes'] = self.classes
         self.send_instruction('start_training', content)
 
     def seg_checkbox_change(self, state):
@@ -1236,6 +1249,31 @@ class RootPainter(QtWidgets.QMainWindow):
             self.scene.annot_pixmap_holder.setPixmap(self.scene.annot_pixmap)
             self.annot_visible = True
         self.vis_widget.annot_checkbox.setChecked(self.annot_visible)
+
+    def add_class_brushes(self, brush_menu):
+        """ One brush per class from the project file. Background is W,
+            classes are 1, 2, 3... and Q is also the first class. """
+        def make_color(rgba):
+            r, g, b, a = [int(round(v)) for v in rgba]
+            return QtGui.QColor(r, g, b, a)
+
+        def set_brush(color, _event):
+            self.scene.brush_color = color
+            self.update_cursor()
+
+        self.scene.background_color = make_color(self.classes[0][1])
+        self.scene.foreground_color = make_color(self.classes[1][1])
+        self.scene.brush_color = self.scene.foreground_color
+
+        for i, (name, rgba, shortcut) in enumerate(self.classes):
+            color = make_color(rgba)
+            action = QtWidgets.QAction(QtGui.QIcon(""), name, self)
+            shortcuts = [shortcut]
+            if i == 1:
+                shortcuts.append('Q')
+            action.setShortcuts([QtGui.QKeySequence(s) for s in shortcuts])
+            brush_menu.addAction(action)
+            action.triggered.connect(partial(set_brush, color))
 
     def set_foreground_color(self, _event):
         self.scene.brush_color = self.scene.foreground_color
